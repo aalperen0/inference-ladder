@@ -1,0 +1,21 @@
+[project]
+name = "inference-ladder"
+version = "0.1.0"
+description = "GPT-2 inference from scratch, one rung at a time: KV cache, prefill vs decode, batching."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.4",
+    "tiktoken",
+    "matplotlib",
+    "numpy",
+    "tqdm",
+    # only for downloading GPT-2 weights and as a parity reference
+    "transformers",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
