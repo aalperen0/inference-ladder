@@ -5,32 +5,16 @@ import torch.nn.functional as F
 import tiktoken
 from torch.utils.data import Dataset
 
-"""
-
- Small config for training on TinyStories (~30M params with tied weights).
- For Rung 0 (loading real GPT-2 124M): embed_dim=768, context_length=1024,
- n_heads=12, n_layers=12, qkv_bias=True.
- 
-"""
-cfg = GptConfig(
-    vocab_size=50257,
-    embed_dim=384,
-    context_length=256,
-    n_heads=6,
-    n_layers=6,
-    drop_rate=0.1,
-    qkv_bias=False,
-)
-
 
 class GPTModel(nn.Module):
-    def __init__(self):
+    def __init__(self, cfg: GptConfig):
         super().__init__()
+        self.cfg = cfg
         self.tok_embd = nn.Embedding(cfg.vocab_size, cfg.embed_dim)
         self.pos_embd = nn.Embedding(cfg.context_length, cfg.embed_dim)
         self.drop = nn.Dropout(cfg.drop_rate)
-        self.trf_blocks = nn.Sequential(
-            *[TransformerBlock() for _ in range(cfg.n_layers)]
+        self.trf_blocks = nn.ModuleList(
+            [TransformerBlock(cfg) for _ in range(cfg.n_layers)]
         )
         self.norm = LayerNorm(cfg.embed_dim)
         self.out = nn.Linear(cfg.embed_dim, cfg.vocab_size, bias=False)
@@ -40,21 +24,28 @@ class GPTModel(nn.Module):
 
     @staticmethod
     def _init_weights(module):
-        # GPT-2 init. nn.Embedding's default N(0, 1) is far too large once it is
-        # also the output layer: initial logits would have std ~sqrt(embed_dim).
         if isinstance(module, (nn.Linear, nn.Embedding)):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
         if isinstance(module, nn.Linear) and module.bias is not None:
             nn.init.zeros_(module.bias)
 
-    def forward(self, X):
+    def forward(self, X, cache=None):
         B, T = X.shape
+        # With a cache, the new tokens come after the ones already stored.
+        pos = cache.current_pos if cache is not None else 0
+        assert pos + T <= self.cfg.context_length, "sequence longer than context_length"
+
         tok_embd = self.tok_embd(X)
-        pos_embd = self.pos_embd(torch.arange(T, device=X.device))
+        pos_embd = self.pos_embd(torch.arange(pos, pos + T, device=X.device))
 
         X = tok_embd + pos_embd
         X = self.drop(X)
-        X = self.trf_blocks(X)
+
+        for i, block in enumerate(self.trf_blocks):
+            X = block(X, cache, i)
+        if cache is not None:
+            cache.advance(T)  # once, after every layer has stored its T new tokens
+
         X = self.norm(X)
         logits = self.out(X)
         return logits
@@ -102,17 +93,23 @@ class MultiHeadAttention(nn.Module):
         B, T, _ = X.shape
         return X.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-    def forward(self, X):
+    def forward(self, X, cache=None, layer_idx=None):
         B, T, C = X.shape
         queries = self.split_heads(self.query_proj(X))
         keys = self.split_heads(self.key_proj(X))
         values = self.split_heads(self.value_proj(X))
 
+        pos = cache.current_pos if cache is not None else 0
+        if cache is not None:
+            # store the new k, v first so the new tokens also attend to themselves
+            keys, values = cache.update(layer_idx, keys, values)
+
         # Q @ K.T
         attn_scores = queries @ keys.transpose(
             2, 3
         )  # B,H,Tq,hd @ B,H,hd,Tk -> B,H,Tq,Tk
-        attn_bool = self.mask.bool()[:T, :T]
+
+        attn_bool = self.mask.bool()[pos : pos + T, : pos + T]
 
         attn_scores.masked_fill_(attn_bool, -torch.inf)
 
@@ -127,7 +124,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self):
+    def __init__(self, cfg: GptConfig):
         super().__init__()
         self.att = MultiHeadAttention(
             d_in=cfg.embed_dim,
@@ -138,15 +135,15 @@ class TransformerBlock(nn.Module):
             qkv_bias=cfg.qkv_bias,
         )
 
-        self.ff = FeedForward()
+        self.ff = FeedForward(cfg)
         self.norm1 = LayerNorm(cfg.embed_dim)
         self.norm2 = LayerNorm(cfg.embed_dim)
         self.drop_shortcut = nn.Dropout(cfg.drop_rate)
 
-    def forward(self, X):
+    def forward(self, X, cache=None, layer_idx=None):
         shortcut = X
         X = self.norm1(X)
-        X = self.att(X)
+        X = self.att(X, cache, layer_idx)
         X = self.drop_shortcut(X)
         X = X + shortcut
 
@@ -173,7 +170,7 @@ class LayerNorm(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self):
+    def __init__(self, cfg: GptConfig):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Linear(cfg.embed_dim, 4 * cfg.embed_dim),

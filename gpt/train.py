@@ -10,7 +10,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from model import GPTDataset, GPTModel, cfg, text_to_tokenIDS, tokenIDS_to_text
+from config import TINYSTORIES_30M
+from model import GPTDataset, GPTModel, text_to_tokenIDS, tokenIDS_to_text
 
 
 def create_dataloader_v1(
@@ -76,7 +77,7 @@ def sample_text(model, tokenizer, device, prompt, max_new_tokens=50):
     was_training = model.training
     model.eval()
     idx = text_to_tokenIDS(prompt, tokenizer).to(device)
-    out = generate_greedy(model, idx, max_new_tokens, cfg.context_length)
+    out = generate_greedy(model, idx, max_new_tokens, model.cfg.context_length)
     model.train(was_training)
     return tokenIDS_to_text(out.cpu(), tokenizer).replace("\n", " ")
 
@@ -193,7 +194,7 @@ def train(
                     torch.save(
                         {
                             "model": model.state_dict(),
-                            "cfg": dataclasses.asdict(cfg),
+                            "cfg": dataclasses.asdict(model.cfg),
                             "step": step,
                             "val_loss": val_loss,
                         },
@@ -267,7 +268,7 @@ def main():
     )
     print(f"train batches {len(train_loader)} | val batches {len(val_loader)}")
 
-    model = GPTModel().to(device)
+    model = GPTModel(TINYSTORIES_30M).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"params {n_params / 1e6:.1f}M on {device}")
 

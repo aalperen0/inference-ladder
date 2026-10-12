@@ -10,7 +10,9 @@ dependencies = [
     "matplotlib",
     "numpy",
     "tqdm",
-    # only for downloading GPT-2 weights and as a parity reference
+    "huggingface_hub",
+    "safetensors",
+    # only as the parity reference in tests/
     "transformers",
 ]
 
@@ -19,3 +21,4 @@ dev = ["pytest"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["gpt"]

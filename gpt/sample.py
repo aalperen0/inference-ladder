@@ -7,8 +7,10 @@ import tiktoken
 import torch
 from matplotlib.ticker import PercentFormatter
 
-import model as gm
+from config import GPT2_PRESETS, TINYSTORIES_30M, GptConfig
+from load import load_gpt2
 from model import GPTModel, text_to_tokenIDS, tokenIDS_to_text
+from kv_cache import CACHE_KINDS, make_cache
 
 # Ordinal blue ramp (light -> dark = low -> high temperature), validated light->dark.
 TEMP_RAMP = [
@@ -30,12 +32,14 @@ GRID, BASELINE = "#e1e0d9", "#c3c2b7"
 
 
 def load_model(ckpt_path, device):
+    """A checkpoint file from train.py, or a GPT-2 name like "gpt2" / "gpt2-medium"."""
+    if ckpt_path in GPT2_PRESETS:
+        return load_gpt2(ckpt_path, device), {"step": "pretrained"}
+
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    # The model classes read the module-level cfg when built, so set it first.
-    if "cfg" in ckpt:
-        for k, v in ckpt["cfg"].items():
-            setattr(gm.cfg, k, v)
-    model = GPTModel().to(device)
+    # Old checkpoints have no stored config; they were all the TinyStories model.
+    cfg = GptConfig(**ckpt["cfg"]) if "cfg" in ckpt else TINYSTORIES_30M
+    model = GPTModel(cfg).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model, ckpt
@@ -43,13 +47,38 @@ def load_model(ckpt_path, device):
 
 @torch.inference_mode()
 def generate(
-    model, idx, max_new_tokens, temperature=0.6, top_k=20, top_p=1.0, eos_id=None
+    model,
+    idx,
+    max_new_tokens,
+    temperature=0.6,
+    top_k=20,
+    top_p=1.0,
+    eos_id=None,
+    use_cache=False,
 ):
-    """idx: (B, T) token ids. temperature=0 is greedy; top_k=0 / top_p=1.0 disable them."""
+    """idx: (B, T) token ids. temperature=0 is greedy; top_k=0 / top_p=1.0 disable them.
+    use_cache: False = no cache, "cat" / "static" = that KV cache (True means "static")."""
+    cache = None
+    if use_cache:
+        kind = "static" if use_cache is True else use_cache
+        prompt_len = idx.shape[1]
+        max_T = prompt_len + max_new_tokens
+        assert max_T <= model.cfg.context_length, (
+            f"with a cache, prompt ({prompt_len}) + new tokens ({max_new_tokens}) "
+            f"must fit in context_length ({model.cfg.context_length})"
+        )
+        cache = make_cache(kind, model, batch_size=idx.shape[0], max_T=max_T)
+
     for _ in range(max_new_tokens):
-        idx_cond = idx[:, -gm.cfg.context_length :]
+        if cache is None:  # if no cache
+            idx_cond = idx[:, -model.cfg.context_length :]
+        elif cache.current_pos == 0:  # prefill if the cache is empty
+            idx_cond = idx
+        else:
+            idx_cond = idx[:, -1:]  # only the last token
+
         # BATCH, N_TOKEN, VOCAB_SIZE -> BATCH, VOCAB_SIZE
-        logits = model(idx_cond)[:, -1, :]
+        logits = model(idx_cond, cache)[:, -1, :]
 
         if temperature == 0:
             # greedy:
@@ -90,7 +119,7 @@ def generate(
 @torch.inference_mode()
 def next_token_logits(model, idx):
     """Logits for the token after the prompt: (V,) on CPU."""
-    return model(idx[:, -gm.cfg.context_length :])[0, -1, :].float().cpu()
+    return model(idx[:, -model.cfg.context_length :])[0, -1, :].float().cpu()
 
 
 def token_label(tokenizer, token_id):
@@ -178,6 +207,14 @@ def main():
     p.add_argument("--top-p", type=float, default=1.0, help="1.0 = no top-p")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument(
+        "--use-cache",
+        nargs="?",
+        const="static",
+        default=None,
+        choices=CACHE_KINDS,
+        help='KV cache: "--use-cache" = static, "--use-cache cat"; omit for no cache',
+    )
+    p.add_argument(
         "--plot",
         action="store_true",
         help="plot next-token probabilities at several temperatures instead of generating",
@@ -203,9 +240,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = tiktoken.get_encoding("gpt2")
     model, ckpt = load_model(args.ckpt, device)
-    print(
-        f"loaded {args.ckpt} (step {ckpt.get('step')}, val {ckpt.get('val_loss', 0):.3f}) on {device}"
-    )
+    val = f", val {ckpt['val_loss']:.3f}" if "val_loss" in ckpt else ""
+    print(f"loaded {args.ckpt} (step {ckpt.get('step')}{val}) on {device}")
 
     def run(prompt):
         if args.plot:
@@ -236,6 +272,7 @@ def main():
                 top_k=args.top_k,
                 top_p=args.top_p,
                 eos_id=tokenizer.eot_token,
+                use_cache=args.use_cache,
             )
             if args.num_samples > 1:
                 print(f"--- sample {i + 1}")
