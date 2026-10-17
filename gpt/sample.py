@@ -57,7 +57,7 @@ def generate(
     use_cache=False,
 ):
     """idx: (B, T) token ids. temperature=0 is greedy; top_k=0 / top_p=1.0 disable them.
-    use_cache: False = no cache, "cat" / "static" = that KV cache (True means "static")."""
+    use_cache: False = no cache, "cat" / "static" / "slot" = that KV cache (True means "static")."""
     cache = None
     if use_cache:
         kind = "static" if use_cache is True else use_cache
@@ -212,7 +212,7 @@ def main():
         const="static",
         default=None,
         choices=CACHE_KINDS,
-        help='KV cache: "--use-cache" = static, "--use-cache cat"; omit for no cache',
+        help='KV cache: "--use-cache" = static, "--use-cache cat|slot"; omit for no cache',
     )
     p.add_argument(
         "--plot",

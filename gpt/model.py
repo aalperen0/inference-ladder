@@ -32,11 +32,17 @@ class GPTModel(nn.Module):
     def forward(self, X, cache=None):
         B, T = X.shape
         # With a cache, the new tokens come after the ones already stored.
+        # (With a slot cache every row has its own position; current_pos is the longest row.)
         pos = cache.current_pos if cache is not None else 0
         assert pos + T <= self.cfg.context_length, "sequence longer than context_length"
 
         tok_embd = self.tok_embd(X)
-        pos_embd = self.pos_embd(torch.arange(pos, pos + T, device=X.device))
+        pos_ids = (
+            cache.positions(T, X.device)
+            if cache is not None
+            else torch.arange(T, device=X.device)
+        )
+        pos_embd = self.pos_embd(pos_ids)  # (T, C), or (B, T, C) with a position per row
 
         X = tok_embd + pos_embd
         X = self.drop(X)
@@ -99,7 +105,12 @@ class MultiHeadAttention(nn.Module):
         keys = self.split_heads(self.key_proj(X))
         values = self.split_heads(self.value_proj(X))
 
-        pos = cache.current_pos if cache is not None else 0
+        # positions of the new tokens: (T,), or (B, T) when every row has its own (slot cache)
+        pos_ids = (
+            cache.positions(T, X.device)
+            if cache is not None
+            else torch.arange(T, device=X.device)
+        )
         if cache is not None:
             # store the new k, v first so the new tokens also attend to themselves
             keys, values = cache.update(layer_idx, keys, values)
@@ -109,7 +120,11 @@ class MultiHeadAttention(nn.Module):
             2, 3
         )  # B,H,Tq,hd @ B,H,hd,Tk -> B,H,Tq,Tk
 
-        attn_bool = self.mask.bool()[pos : pos + T, : pos + T]
+        # A query at position p sees keys 0..p, so its mask row is row p. Per row, that also
+        # hides the keys past a short row's own length.
+        attn_bool = self.mask.bool()[pos_ids, : keys.shape[2]]
+        if attn_bool.dim() == 3:
+            attn_bool = attn_bool.unsqueeze(1)  # (B, 1, Tq, Tk): the same for every head
 
         attn_scores.masked_fill_(attn_bool, -torch.inf)
 
