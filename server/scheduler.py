@@ -18,7 +18,11 @@ class Request:
     max_new_tokens: int
     arrival: float
     priority: int = 0
-    status: str = "waiting"
+    ignore_eos: bool = (
+        False  # generate all max_new_tokens even past EOS, as benchmarks do
+    )
+    status: str = "waiting"  # waiting → active → finished; or rejected, or aborted
+    reject_reason: str | None = None
     slot: int | None = None
     tokens_generated: int = 0
     output_tokens: list[int] = field(default_factory=list)
@@ -66,30 +70,57 @@ class ContinuousBatchScheduler:
         self.waiting = deque()
         self.active = []
         self.finished = []
+        self.rejected = []
+        self.aborted = []
 
-    def add_request(self, request: Request) -> None:
+    def rejection_reason(self, request: Request) -> str | None:
+
         if request.kv_tokens > self.max_T:
-            raise ValueError(
-                f"Request {request.request_id} requires "
-                f"{request.kv_tokens} tokens, but max_T={self.max_T}"
+            return (
+                f"request {request.request_id} needs {request.kv_tokens} tokens "
+                f"(prompt + max_new_tokens), but a slot holds max_T={self.max_T}"
             )
-
         if request.kv_tokens > self.kv_budget_tokens:
-            raise ValueError("Request exceeds KV Token budget")
+            return (
+                f"request {request.request_id} needs {request.kv_tokens} tokens, "
+                f"more than the whole KV budget of {self.kv_budget_tokens}"
+            )
+        return None
+
+    def add_request(self, request: Request) -> bool:
+        reason = self.rejection_reason(request)
+        if reason is not None:
+            request.status = "rejected"
+            request.reject_reason = reason
+            self.rejected.append(request)
+            return False
 
         self.waiting.append(request)
+        return True
+
+    def abort(self, request: Request) -> None:
+        """Stops a request before it finishes. A waiting one leaves the queue now; an active one
+        keeps its slot until the next schedule()"""
+        if request.status == "waiting":
+            self.waiting.remove(request)
+            request.status = "aborted"
+            self.aborted.append(request)
+        elif request.status == "active":
+            request.status = "aborted"
 
     def _release(self, request: Request) -> None:
         self.reserved -= request.kv_tokens
         self.cache.release(request.slot)
-        self.finished.append(request)
+        (self.finished if request.status == "finished" else self.aborted).append(
+            request
+        )
 
     def schedule(self, now: float) -> list[Request]:
 
         remaining = []
 
         for req in self.active:
-            if req.status == "finished":
+            if req.status in ("finished", "aborted"):
                 self._release(req)
             else:
                 remaining.append(req)
@@ -131,6 +162,6 @@ class ContinuousBatchScheduler:
         request.tokens_generated += 1
         request.token_times.append(now)
 
-        if request.is_done() or token == self.eos_id:
+        if request.is_done() or (token == self.eos_id and not request.ignore_eos):
             request.status = "finished"
             request.finished_at = now

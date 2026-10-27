@@ -12,6 +12,10 @@ dependencies = [
     "tqdm",
     "huggingface_hub",
     "safetensors",
+    # the HTTP server (server/api.py), and the load client and its tests
+    "fastapi",
+    "uvicorn",
+    "httpx",
     # only as the parity reference in tests/
     "transformers",
 ]
@@ -21,4 +25,4 @@ dev = ["pytest"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["gpt"]
+pythonpath = ["gpt", "server", "bench"]
