@@ -1,5 +1,7 @@
-"""Rung 1: running with the KV cache must give the same result as running without it.
-Every cache test runs twice: once with the cat cache, once with the static one.
+"""
+Running with the KV cache must give the same result as running without it.
+Every cache test runs once per cache kind: cat, static and slot (one slot per batch row).
+The slot cache's own tests run requests of different lengths in one batch.
 
 Logits are compared in float64 on the CPU. In fp32 the two paths differ by up to
 7.5e-3 on GPU logits of magnitude ~285 (measured), only from rounding: the cached
@@ -14,7 +16,7 @@ import tiktoken
 import torch
 
 from config import GptConfig, gpt2_config
-from kv_cache import CACHE_KINDS, StaticKVCache, make_cache
+from kv_cache import CACHE_KINDS, SlotKVCache, StaticKVCache, make_cache
 from load import load_gpt2
 from model import GPTModel
 from sample import generate
@@ -26,7 +28,7 @@ PROMPT = "The meaning of life is"
 
 @pytest.fixture(params=CACHE_KINDS)
 def kind(request):
-    """Runs each test that uses it once per cache kind: "cat" and "static"."""
+    """Runs each test that uses it once per cache kind: "cat", "static" and "slot"."""
     return request.param
 
 
@@ -113,7 +115,7 @@ def test_cache_holds_every_token(model64, tokenizer, kind):
         for layer in range(cfg.n_layers):
             assert cache.key_cache[layer].shape == (1, cfg.n_heads, T, head_dim)
             assert cache.value_cache[layer].shape == (1, cfg.n_heads, T, head_dim)
-    else:  # allocated once at max_T = prompt + steps, never grows
+    else:  # static and slot: allocated once at max_T = prompt + steps, never grows
         assert cache.key_cache.shape == (cfg.n_layers, 1, cfg.n_heads, T, head_dim)
         assert cache.value_cache.shape == cache.key_cache.shape
 
@@ -195,6 +197,121 @@ def test_static_cache_full_raises(tiny):
     tiny(random_ids((1, 5), tiny.cfg.vocab_size, seed=5), cache)
     with pytest.raises(ValueError):
         tiny(torch.zeros((1, 1), dtype=torch.long), cache)
+
+
+# --- the slot cache: requests of different lengths in one batch ----------------------
+
+
+def empty_slot_cache(model, n_slots, max_T):
+    cfg = model.cfg
+    weight = model.tok_embd.weight
+    return SlotKVCache(
+        n_layers=cfg.n_layers,
+        n_slots=n_slots,
+        n_heads=cfg.n_heads,
+        max_T=max_T,
+        head_dim=cfg.embed_dim // cfg.n_heads,
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+
+
+@torch.inference_mode()
+def start_request(model, cache, prompt):
+    """Claims a slot and prefills the prompt in it alone.
+    Returns (slot, seq): seq is the prompt plus its greedy next token, not yet in the cache."""
+    slot = cache.allocate()
+    cache.select([slot])
+    nxt = model(prompt, cache)[:, -1].argmax(dim=-1, keepdim=True)
+    return slot, torch.cat([prompt, nxt], dim=1)
+
+
+@torch.inference_mode()
+def decode_together(model, cache, seqs, steps):
+    """Greedy-decodes the requests {slot: seq} in one batch, rows in the dict's order.
+    Every step, each row's logits must match its own sequence run alone without a cache."""
+    slots = list(seqs)
+    cache.select(slots)
+    for _ in range(steps):
+        last = torch.cat([seqs[s][:, -1:] for s in slots])  # (B, 1)
+        cached = model(last, cache)[:, -1]
+        for row, s in enumerate(slots):
+            uncached = model(seqs[s])[0, -1]
+            torch.testing.assert_close(cached[row], uncached, atol=ATOL_FP64, rtol=0)
+            seqs[s] = torch.cat([seqs[s], cached[row].argmax().view(1, 1)], dim=1)
+
+
+def test_slot_requests_of_different_lengths(model64):
+    """Prompts of 3, 7 and 12 tokens decoded in one batch: catches one position for the
+    whole batch (each row needs its own) and a short row attending past its own length."""
+    cache = empty_slot_cache(model64, n_slots=3, max_T=24)
+    V = model64.cfg.vocab_size
+    seqs = dict(
+        start_request(model64, cache, random_ids((1, n), V, seed=10 + n))
+        for n in (3, 7, 12)
+    )
+    decode_together(model64, cache, seqs, steps=8)
+
+
+def test_slot_left_out_of_batch_is_untouched(model64):
+    """Decode slots 2 and 0 (in that order) while slot 1 waits, then all three: catches
+    rows going to the wrong slot, and writes or positions leaking into an unselected slot."""
+    cache = empty_slot_cache(model64, n_slots=3, max_T=24)
+    V = model64.cfg.vocab_size
+    seqs = dict(
+        start_request(model64, cache, random_ids((1, n), V, seed=20 + n))
+        for n in (4, 9, 6)
+    )
+    batch = {2: seqs[2], 0: seqs[0]}
+    decode_together(model64, cache, batch, steps=4)
+    decode_together(model64, cache, {**batch, 1: seqs[1]}, steps=4)
+
+
+def test_reused_slot_ignores_previous_request(model64):
+    """A released slot still holds the old request's k, v. A short new request batched with
+    a longer one reads columns past its own length, and they must stay masked."""
+    cache = empty_slot_cache(model64, n_slots=2, max_T=24)
+    V = model64.cfg.vocab_size
+    old, _ = start_request(model64, cache, random_ids((1, 16), V, seed=30))
+    other, other_seq = start_request(model64, cache, random_ids((1, 10), V, seed=31))
+    cache.release(old)
+    new, new_seq = start_request(model64, cache, random_ids((1, 3), V, seed=32))
+    assert new == old
+    decode_together(model64, cache, {new: new_seq, other: other_seq}, steps=5)
+
+
+def test_slot_cache_bookkeeping(tiny):
+    cache = empty_slot_cache(tiny, n_slots=2, max_T=8)
+    a, b = cache.allocate(), cache.allocate()
+    assert (a, b) == (0, 1)
+    with pytest.raises(RuntimeError):
+        cache.allocate()  # every slot is in use
+    cache.select([b, a])
+    cache.release(a)
+    assert cache.slots == [b]  # a released slot leaves the batch
+    with pytest.raises(ValueError):
+        cache.release(a)  # already free
+    with pytest.raises(ValueError):
+        cache.select([a])  # not in use
+    with pytest.raises(ValueError):
+        cache.select([b, b])  # the same slot twice
+    assert cache.allocate() == a
+
+
+@torch.inference_mode()
+def test_slot_cache_full_or_wrong_batch_raises(tiny):
+    """A row going past max_T must fail loudly even if the others fit, and so must a batch
+    whose row count is not the number of selected slots."""
+    cache = empty_slot_cache(tiny, n_slots=2, max_T=5)
+    V = tiny.cfg.vocab_size
+    a, _ = start_request(tiny, cache, random_ids((1, 5), V, seed=40))
+    b, _ = start_request(tiny, cache, random_ids((1, 2), V, seed=41))
+    cache.select([a, b])
+    with pytest.raises(ValueError):
+        tiny(torch.zeros((2, 1), dtype=torch.long), cache)
+    cache.select([b])
+    with pytest.raises(ValueError):
+        tiny(torch.zeros((2, 1), dtype=torch.long), cache)
 
 
 # --- generate(use_cache=...) ---------------------------------------------------------

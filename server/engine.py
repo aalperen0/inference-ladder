@@ -12,7 +12,7 @@ import time
 from config import GPT2_PRESETS, gpt2_config
 from kv_cache import SlotKVCache
 from model import GPTModel
-from scheduler import POLICIES, ContinuousBatchScheduler
+from scheduler import ContinuousBatchScheduler, Policies, RequestStatus
 
 
 def make_slot_cache(model: GPTModel, n_slots: int, max_T: int) -> SlotKVCache:
@@ -34,7 +34,13 @@ class Rejected(Exception):
 
 class AsyncEngine:
     def __init__(
-        self, model, cache, kv_budget_tokens, policy="fcfs", max_wait=None, eos_id=None
+        self,
+        model,
+        cache,
+        kv_budget_tokens,
+        policy=Policies.FCFS,
+        max_wait=None,
+        eos_id=None,
     ):
         self.model = model
         self.sched = ContinuousBatchScheduler(
@@ -71,7 +77,7 @@ class AsyncEngine:
 
         reason = self.sched.rejection_reason(request)  # reads only max_T and the budget
         if reason is not None:
-            request.status = "rejected"
+            request.status = RequestStatus.REJECTED
             request.reject_reason = reason
             raise Rejected(reason)
 
@@ -79,6 +85,7 @@ class AsyncEngine:
         q = self._streams[request.request_id] = asyncio.Queue()
         self._inbox.append(request)
         self._wake.set()
+
         try:
             while (tok := await q.get()) is not None:
                 if isinstance(tok, Exception):  # a step failed
@@ -86,7 +93,7 @@ class AsyncEngine:
                 yield tok
         finally:
             del self._streams[request.request_id]
-            if request.status in ("waiting", "active"):
+            if request.status in (RequestStatus.WAITING, RequestStatus.ACTIVE):
                 self.abort(request)
 
     def abort(self, request: Request):
@@ -143,7 +150,7 @@ class AsyncEngine:
             # that: a prefill chunk gives no token.
             for r in batch:
                 self._send(r, r.output_tokens[-1])
-                if r.status == "finished":
+                if r.status == RequestStatus.FINISHED:
                     self._send(r, None)
 
     def _send(self, r: Request, item):
@@ -185,7 +192,12 @@ def add_engine_args(p: argparse.ArgumentParser):
     g.add_argument(
         "--model", default="gpt2", choices=list(GPT2_PRESETS), help="GPT-2 size"
     )
-    g.add_argument("--policy", default="fcfs", choices=POLICIES, help="admission order")
+    g.add_argument(
+        "--policy",
+        default=Policies.FCFS,
+        choices=list(Policies),
+        help="admission order",
+    )
     g.add_argument(
         "--max-wait",
         type=float,
@@ -199,7 +211,7 @@ def add_engine_args(p: argparse.ArgumentParser):
 
 def check_engine_args(p: argparse.ArgumentParser, args: argparse.Namespace):
     """Runs before the model loads, so a bad flag fails right away."""
-    if args.policy == "max_wait" and args.max_wait is None:
+    if args.policy == Policies.MAX_WAIT and args.max_wait is None:
         p.error("--policy max_wait needs --max-wait")
     context_length = gpt2_config(args.model).context_length
     if args.max_T > context_length:

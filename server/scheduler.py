@@ -1,6 +1,7 @@
 import time
-from collections import deque
 from dataclasses import dataclass, field
+from enum import StrEnum
+from request_queue import FCFSRequestQueue, MaxWaitRequestQueue, PriorityRequestQueue
 
 
 # MEMORY MATH -> K and V × 12 layers × 768 (heads × head_dim) × 4 B (fp32) = 72 kB per token
@@ -8,7 +9,19 @@ from dataclasses import dataclass, field
 # at 128K tokens: 72 kB * 131072(32 times of 4096) = 9.5 gB
 KV_BYTES_PER_TOKEN = 2 * 12 * 768 * 4
 
-POLICIES = ("fcfs", "priority", "max_wait")
+
+class Policies(StrEnum):
+    FCFS = "fcfs"
+    PRIORITY = "priority"
+    MAX_WAIT = "max_wait"
+
+
+class RequestStatus(StrEnum):
+    WAITING = "waiting"
+    ACTIVE = "active"
+    FINISHED = "finished"
+    REJECTED = "rejected"
+    ABORTED = "aborted"
 
 
 @dataclass
@@ -18,10 +31,10 @@ class Request:
     max_new_tokens: int
     arrival: float
     priority: int = 0
-    ignore_eos: bool = (
-        False  # generate all max_new_tokens even past EOS, as benchmarks do
-    )
-    status: str = "waiting"  # waiting → active → finished; or rejected, or aborted
+    ignore_eos: bool = False
+    status: RequestStatus = (
+        RequestStatus.WAITING
+    )  # WAITING → ACTIVE → FINISHED; or REJECTED, or ABORTED
     reject_reason: str | None = None
     slot: int | None = None
     tokens_generated: int = 0
@@ -41,6 +54,22 @@ class Request:
     def is_done(self) -> bool:
         return self.tokens_generated >= self.max_new_tokens
 
+    def __lt__(self, other: "Request") -> bool:
+        """The priority heap's order. The request_id only breaks exact ties."""
+        return (self.priority, self.arrival, self.request_id) < (
+            other.priority,
+            other.arrival,
+            other.request_id,
+        )
+
+
+def create_request_queue(policy: Policies, max_wait: float | None = None):
+    if policy == Policies.FCFS:
+        return FCFSRequestQueue()
+    if policy == Policies.PRIORITY:
+        return PriorityRequestQueue()
+    return MaxWaitRequestQueue(max_wait)
+
 
 class ContinuousBatchScheduler:
     """the scheduler needs to decide whether a waiting request can be admitted, reserve its KV-cache capacity, and assign it a free slot.
@@ -51,14 +80,16 @@ class ContinuousBatchScheduler:
     """
 
     def __init__(
-        self, cache, kv_budget_tokens, policy="fcfs", max_wait=None, eos_id=None
+        self, cache, kv_budget_tokens, policy=Policies.FCFS, max_wait=None, eos_id=None
     ):
-        if policy not in POLICIES:
-            raise ValueError(f"unknown policy {policy!r}; choose from {POLICIES}")
-        if policy == "max_wait" and max_wait is None:
+        if policy not in Policies:
+            raise ValueError(
+                f"unknown policy {policy!r}; choose from {', '.join(Policies)}"
+            )
+        if policy == Policies.MAX_WAIT and max_wait is None:
             raise ValueError("the max_wait policy needs max_wait, in seconds")
         self.cache = cache
-        self.policy = policy
+        self.policy = Policies(policy)
         self.max_wait = max_wait
         self.eos_id = eos_id
         self.max_batch_size = cache.key_cache.shape[1]  # slot
@@ -67,7 +98,7 @@ class ContinuousBatchScheduler:
         self.reserved = 0
         self.kv_budget_tokens = kv_budget_tokens
 
-        self.waiting = deque()
+        self.waiting = create_request_queue(self.policy, max_wait)
         self.active = []
         self.finished = []
         self.rejected = []
@@ -88,74 +119,58 @@ class ContinuousBatchScheduler:
         return None
 
     def add_request(self, request: Request) -> bool:
+        """Add request to the queue if it's not rejected"""
+
         reason = self.rejection_reason(request)
         if reason is not None:
-            request.status = "rejected"
+            request.status = RequestStatus.REJECTED
             request.reject_reason = reason
             self.rejected.append(request)
             return False
 
-        self.waiting.append(request)
+        self.waiting.add_request(request)
         return True
 
     def abort(self, request: Request) -> None:
         """Stops a request before it finishes. A waiting one leaves the queue now; an active one
         keeps its slot until the next schedule()"""
-        if request.status == "waiting":
-            self.waiting.remove(request)
-            request.status = "aborted"
+        if request.status == RequestStatus.WAITING:
+            self.waiting.remove_request(request)
+            request.status = RequestStatus.ABORTED
             self.aborted.append(request)
-        elif request.status == "active":
-            request.status = "aborted"
+        elif request.status == RequestStatus.ACTIVE:
+            request.status = RequestStatus.ABORTED
 
     def _release(self, request: Request) -> None:
         self.reserved -= request.kv_tokens
         self.cache.release(request.slot)
-        (self.finished if request.status == "finished" else self.aborted).append(
-            request
-        )
+        finished = request.status == RequestStatus.FINISHED
+        (self.finished if finished else self.aborted).append(request)
 
     def schedule(self, now: float) -> list[Request]:
 
         remaining = []
 
         for req in self.active:
-            if req.status in ("finished", "aborted"):
+            if req.status in (RequestStatus.FINISHED, RequestStatus.ABORTED):
                 self._release(req)
             else:
                 remaining.append(req)
 
         self.active = remaining
-        self._sort_waiting(now)
 
         while self.waiting and self.cache.free:
-            req = self.waiting[0]
+            req = self.waiting.peek_request(now)
+            if self.reserved + req.kv_tokens > self.kv_budget_tokens:
+                break  # the next request doesn't fit yet, so the ones behind it wait
 
-            if self.reserved + req.kv_tokens <= self.kv_budget_tokens:
-                self.waiting.popleft()
-                req.slot = self.cache.allocate()
-                self.reserved += req.kv_tokens
-                req.status = "active"
-                self.active.append(req)
-            else:
-                break  # the first request doesn't fit yet, so the ones behind it wait
+            self.waiting.pop_request(now)
+            req.slot = self.cache.allocate()
+            self.reserved += req.kv_tokens
+            req.status = RequestStatus.ACTIVE
+            self.active.append(req)
 
         return list(self.active)
-
-    def _sort_waiting(self, now: float) -> None:
-        """Orders `waiting` so the request the policy admits next is at the front."""
-        if self.policy == "fcfs":
-            key = lambda r: r.arrival
-        elif self.policy == "priority":
-            key = lambda r: (r.priority, r.arrival)  # ties go to whoever came first
-        else:  # max_wait: priority, but past max_wait the longest-waiting goes first
-
-            def key(r):
-                if now - r.arrival > self.max_wait:
-                    return (0, 0, r.arrival)
-                return (1, r.priority, r.arrival)
-
-        self.waiting = deque(sorted(self.waiting, key=key))
 
     def update(self, request: Request, token: int, now: float) -> None:
         request.output_tokens.append(token)
@@ -163,5 +178,5 @@ class ContinuousBatchScheduler:
         request.token_times.append(now)
 
         if request.is_done() or (token == self.eos_id and not request.ignore_eos):
-            request.status = "finished"
+            request.status = RequestStatus.FINISHED
             request.finished_at = now
