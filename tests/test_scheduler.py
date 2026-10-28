@@ -3,37 +3,22 @@ The async engine must serve every request exactly as if it ran alone, keep its s
 KV budget straight, and turn every way a request can end (finished, rejected, a client
 leaving, a failed step) into the right state.
 
-The model is a tiny random GPT in float64 on the CPU: fast, and batching changes the
-logits only by ~1e-11, so it can never flip an argmax. The reference is plain greedy
-decoding without a cache, so it shares no code with the engine or the slot cache.
-Each test runs its async body with asyncio.run under a timeout (no pytest-asyncio), so
-an engine stuck waiting fails the test instead of hanging it.
+The model (`tiny`) and the reference (`greedy_alone`) are in conftest.py. Each test runs
+its async body with asyncio.run under a timeout (no pytest-asyncio), so an engine stuck
+waiting fails the test instead of hanging it.
 """
 
 import asyncio
 import contextlib
+import logging
 import random
 from collections import Counter
 
 import pytest
-import torch
 
-from config import GptConfig
+from conftest import MAX_T, V, greedy_alone
 from engine import AsyncEngine, Rejected, make_slot_cache
-from model import GPTModel
 from scheduler import Request
-
-MAX_T = 64  # the tiny model's context_length, and every slot's size
-V = 100  # its vocab size
-
-
-@pytest.fixture(scope="module")
-def tiny():
-    torch.manual_seed(0)
-    cfg = GptConfig(
-        vocab_size=V, embed_dim=32, context_length=MAX_T, n_heads=4, n_layers=2
-    )
-    return GPTModel(cfg).double().eval()
 
 
 def make_requests(n, seed, first_id=0, new_tokens=(2, 12)):
@@ -47,16 +32,6 @@ def make_requests(n, seed, first_id=0, new_tokens=(2, 12)):
         )
         for i in range(n)
     ]
-
-
-@torch.inference_mode()
-def greedy_alone(model, request):
-    """The request's greedy tokens with no engine and no cache: the whole sequence every step."""
-    seq = torch.tensor([request.prompt_tokens])
-    for _ in range(request.max_new_tokens):
-        nxt = model(seq)[:, -1].argmax(dim=-1, keepdim=True)
-        seq = torch.cat([seq, nxt], dim=1)
-    return seq[0, len(request.prompt_tokens) :].tolist()
 
 
 def run(coro, timeout=30):
@@ -148,6 +123,25 @@ def test_one_token_per_request_per_step(served):
     for s in engine.step_log:
         assert s["n_prefill"] + s["n_decode"] == len(s["slots"])
         assert s["t_start"] <= s["t_end"]
+
+
+def test_step_log_fields_add_up(served):
+    """The page draws its slot grid and KV reserved-vs-used curve from these fields."""
+    engine, requests, _ = served
+    by_id = {r.request_id: r for r in requests}
+    steps_so_far = Counter()
+    assert [s["step"] for s in engine.step_log] == list(range(len(engine.step_log)))
+    for s in engine.step_log:
+        for rid, phase, kv_len in zip(s["request_ids"], s["phase"], s["kv_len"]):
+            n = steps_so_far[rid]  # the prefill writes the prompt, each decode one more token
+            assert phase == ("prefill" if n == 0 else "decode")
+            assert kv_len == len(by_id[rid].prompt_tokens) + n
+            steps_so_far[rid] += 1
+        assert s["kv_used"] == sum(s["kv_len"])
+        assert s["kv_reserved"] == sum(by_id[rid].kv_tokens for rid in s["request_ids"])
+        assert s["kv_used"] <= s["kv_reserved"]
+    waiting = [s["waiting"] for s in engine.step_log]
+    assert waiting[0] == len(requests) - 2 and waiting == sorted(waiting, reverse=True)
 
 
 def test_fcfs_admits_in_arrival_order(served):
@@ -343,6 +337,30 @@ def test_finished_rejected_aborted_add_up(tiny):
     accepted = len(engine.sched.finished) + len(engine.sched.aborted)
     assert accepted + outcomes.count("rejected") == len(requests)
     assert_all_freed(engine)
+
+
+def test_event_log_tells_each_request_story(tiny, caplog):
+    """api.py --log-events prints these lines; each request's events come in order."""
+    caplog.set_level(logging.INFO, logger="engine")
+    fits = make_requests(1, seed=9)[0]
+    too_big = Request(request_id=1, prompt_tokens=[1] * 60, max_new_tokens=10, arrival=0.0)
+
+    async def main():
+        async with running(tiny) as engine:
+            await collect(engine, fits)
+            with pytest.raises(Rejected):
+                await collect(engine, too_big)
+
+    run(main())
+    events = [tuple(m.split()[1:3]) for m in caplog.messages]
+    assert events == [
+        ("r0", "queued"),
+        ("r0", "admitted"),
+        ("r0", "finished"),
+        ("r1", "rejected"),
+    ]
+    assert f"{fits.max_new_tokens} tokens" in caplog.messages[2]
+    assert "max_T" in caplog.messages[3]
 
 
 def test_idle_engine_waits_and_stop_ends_it(tiny):

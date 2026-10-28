@@ -6,6 +6,7 @@ __pycache__/
 *.pt
 *.safetensors
 .cache/
+.vscode/
 /docs
 /data
 
