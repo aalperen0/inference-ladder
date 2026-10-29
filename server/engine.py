@@ -8,7 +8,8 @@ from collections.abc import Callable
 import asyncio
 import logging
 import torch
-from scheduler import Request
+from scheduler import Request, Batching
+
 import time
 from config import GPT2_PRESETS, gpt2_config
 from kv_cache import SlotKVCache
@@ -61,6 +62,7 @@ class AsyncEngine:
         model,
         cache,
         kv_budget_tokens,
+        batching=Batching.CONTINUOUS,
         policy=Policies.FCFS,
         max_wait=None,
         eos_id=None,
@@ -72,6 +74,7 @@ class AsyncEngine:
             policy=policy,
             max_wait=max_wait,
             eos_id=eos_id,
+            batching=batching,
         )
         self._streams: dict[int, asyncio.Queue] = {}
         self.error = None
@@ -80,7 +83,9 @@ class AsyncEngine:
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
         self.step_log = []
-        self.n_steps = 0  # all steps so far; step_log only holds those since drain_log()
+        self.n_steps = (
+            0  # all steps so far; step_log only holds those since drain_log()
+        )
         self._rejected = []  # rejected by check(), so they never reach the scheduler
         self._t0 = time.perf_counter()  # the event log's zero
 
@@ -168,7 +173,11 @@ class AsyncEngine:
             for r, ph in zip(batch, phase):
                 if ph == "prefill":
                     waited = f"{(t_start - r.arrival) * 1000:.0f} ms"
-                    self._event(r, "admitted", f"slot {r.slot} after {waited}, {waiting} still waiting")
+                    self._event(
+                        r,
+                        "admitted",
+                        f"slot {r.slot} after {waited}, {waiting} still waiting",
+                    )
             try:
                 await asyncio.to_thread(self.step, self.model, self.sched, clock)
             except Exception as exc:
@@ -214,7 +223,9 @@ class AsyncEngine:
         ended = sched.finished + sched.aborted + sched.rejected + self._rejected
         drained = {
             "steps": self.step_log,
-            "requests": [request_record(r) for r in sorted(ended, key=lambda r: r.request_id)],
+            "requests": [
+                request_record(r) for r in sorted(ended, key=lambda r: r.request_id)
+            ],
         }
         self.step_log, self._rejected = [], []
         sched.finished, sched.aborted, sched.rejected = [], [], []
@@ -279,6 +290,7 @@ def add_engine_args(p: argparse.ArgumentParser):
     g.add_argument("--slots", type=int, default=8, help="requests running at once")
     g.add_argument("--max-T", type=int, default=1024, help="KV tokens per slot")
     g.add_argument("--kv-budget", type=int, default=4096, help="KV tokens, all slots")
+    g.add_argument("--batching", default=Batching.CONTINUOUS, choices=list(Batching))
 
 
 def check_engine_args(p: argparse.ArgumentParser, args: argparse.Namespace):

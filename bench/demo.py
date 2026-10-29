@@ -99,10 +99,10 @@ def reason(r: ClientRecord) -> str:
         return r.error or ""
 
 
-def print_grid(steps: list[dict], records: list[ClientRecord], slots: int):
-    """One column per engine step: which request each slot ran. A request's first cell is its
-    prefill (reverse video in a terminal). The last row is how many were still queued."""
-    label = {r.server_id: cell(r) for r in records if r.server_id is not None}
+def print_grid(steps: list[dict], label: dict[int, str], slots: int):
+    """One column per engine step: which request each slot ran, as label[request_id]. A
+    request's first cell is its prefill (reverse video in a terminal). The last row is how
+    many were still queued."""
     n = len(steps)
     tty = sys.stdout.isatty()
     cells = [["."] * n for _ in range(slots)]
@@ -202,7 +202,8 @@ def main():
     )
     print_table(records, t0, config["slots"])
     if log["steps"]:
-        print_grid(log["steps"], records, config["slots"])
+        label = {r.server_id: cell(r) for r in records if r.server_id is not None}
+        print_grid(log["steps"], label, config["slots"])
     if args.save:
         save_s1(config, args, specs, t0, records, log["steps"])
 

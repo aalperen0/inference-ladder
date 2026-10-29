@@ -1,4 +1,3 @@
-import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from request_queue import FCFSRequestQueue, MaxWaitRequestQueue, PriorityRequestQueue
@@ -22,6 +21,11 @@ class RequestStatus(StrEnum):
     FINISHED = "finished"
     REJECTED = "rejected"
     ABORTED = "aborted"
+
+
+class Batching(StrEnum):
+    STATIC = "static"
+    CONTINUOUS = "continuous"
 
 
 @dataclass
@@ -80,7 +84,13 @@ class ContinuousBatchScheduler:
     """
 
     def __init__(
-        self, cache, kv_budget_tokens, policy=Policies.FCFS, max_wait=None, eos_id=None
+        self,
+        cache,
+        kv_budget_tokens,
+        policy=Policies.FCFS,
+        max_wait=None,
+        eos_id=None,
+        batching=Batching.CONTINUOUS,
     ):
         if policy not in Policies:
             raise ValueError(
@@ -94,6 +104,7 @@ class ContinuousBatchScheduler:
         self.eos_id = eos_id
         self.max_batch_size = cache.key_cache.shape[1]  # slot
         self.max_T = cache.max_T
+        self.batching = Batching(batching)
 
         self.reserved = 0
         self.kv_budget_tokens = kv_budget_tokens
@@ -158,6 +169,9 @@ class ContinuousBatchScheduler:
                 remaining.append(req)
 
         self.active = remaining
+
+        if self.batching == Batching.STATIC and self.active:
+            return list(self.active)
 
         while self.waiting and self.cache.free:
             req = self.waiting.peek_request(now)

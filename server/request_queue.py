@@ -1,5 +1,4 @@
-"""The waiting queue, one kind per admission policy, after vLLM's v1 request_queue.py.
-
+"""
 The scheduler only uses this interface: add_request(r), peek_request(now), pop_request(now),
 remove_request(r), len() and iteration. `now` matters only to max_wait. There is no
 prepend, since nothing here preempts. add_request must be called in arrival order, as the

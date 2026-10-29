@@ -13,12 +13,12 @@ import contextlib
 import logging
 import random
 from collections import Counter
-
 import pytest
 
 from conftest import MAX_T, V, greedy_alone
 from engine import AsyncEngine, Rejected, make_slot_cache
-from scheduler import Request
+from metrics import idle_slot_share
+from scheduler import Batching, Request
 
 
 def make_requests(n, seed, first_id=0, new_tokens=(2, 12)):
@@ -43,8 +43,9 @@ def run(coro, timeout=30):
 
 
 @contextlib.asynccontextmanager
-async def running(model, n_slots=2, kv_budget=10_000):
-    engine = AsyncEngine(model, make_slot_cache(model, n_slots, MAX_T), kv_budget)
+async def running(model, batching=Batching.CONTINUOUS, n_slots=2, kv_budget=10_000):
+    cache = make_slot_cache(model, n_slots, MAX_T)
+    engine = AsyncEngine(model, cache, kv_budget, batching=batching)
     engine.start()
     try:
         yield engine
@@ -66,7 +67,9 @@ async def collect(engine, request, stop_after=None):
 
 async def idle(engine):
     """Waits until the loop has applied every abort and released every slot."""
-    while engine._inbox or engine._aborts or engine.sched.waiting or engine.sched.active:
+    while (
+        engine._inbox or engine._aborts or engine.sched.waiting or engine.sched.active
+    ):
         await asyncio.sleep(0.001)
 
 
@@ -111,7 +114,9 @@ def test_slots_never_shared_and_reused(served):
             assert slot_of.setdefault(rid, slot) == slot  # a request keeps its slot
     requests_per_slot = Counter(slot_of.values())
     assert set(requests_per_slot) == {0, 1}
-    assert min(requests_per_slot.values()) > 1  # every slot served more than one request
+    assert (
+        min(requests_per_slot.values()) > 1
+    )  # every slot served more than one request
 
 
 def test_one_token_per_request_per_step(served):
@@ -133,7 +138,9 @@ def test_step_log_fields_add_up(served):
     assert [s["step"] for s in engine.step_log] == list(range(len(engine.step_log)))
     for s in engine.step_log:
         for rid, phase, kv_len in zip(s["request_ids"], s["phase"], s["kv_len"]):
-            n = steps_so_far[rid]  # the prefill writes the prompt, each decode one more token
+            n = steps_so_far[
+                rid
+            ]  # the prefill writes the prompt, each decode one more token
             assert phase == ("prefill" if n == 0 else "decode")
             assert kv_len == len(by_id[rid].prompt_tokens) + n
             steps_so_far[rid] += 1
@@ -146,7 +153,9 @@ def test_step_log_fields_add_up(served):
 
 def test_fcfs_admits_in_arrival_order(served):
     engine, requests, _ = served
-    first_seen = list(dict.fromkeys(rid for s in engine.step_log for rid in s["request_ids"]))
+    first_seen = list(
+        dict.fromkeys(rid for s in engine.step_log for rid in s["request_ids"])
+    )
     assert first_seen == sorted(first_seen, key=lambda rid: requests[rid].arrival)
 
 
@@ -343,7 +352,9 @@ def test_event_log_tells_each_request_story(tiny, caplog):
     """api.py --log-events prints these lines; each request's events come in order."""
     caplog.set_level(logging.INFO, logger="engine")
     fits = make_requests(1, seed=9)[0]
-    too_big = Request(request_id=1, prompt_tokens=[1] * 60, max_new_tokens=10, arrival=0.0)
+    too_big = Request(
+        request_id=1, prompt_tokens=[1] * 60, max_new_tokens=10, arrival=0.0
+    )
 
     async def main():
         async with running(tiny) as engine:
@@ -378,3 +389,45 @@ def test_idle_engine_waits_and_stop_ends_it(tiny):
         return task
 
     assert run(main()).cancelled()
+
+
+def test_static_batching_waits_for_whole_batch(tiny):
+    requests = make_requests(6, seed=0)
+
+    async def main():
+        async with running(tiny, batching="static", n_slots=2) as engine:
+            outputs = await asyncio.gather(*(collect(engine, r) for r in requests))
+
+        return engine, outputs
+
+    engine, outputs = run(main())
+    for r, out in zip(requests, outputs):
+        assert out == greedy_alone(tiny, r)
+    for s in engine.step_log:
+        assert s["n_prefill"] in (
+            0,
+            len(s["slots"]),
+        )  # a new batch never joins a running one
+    assert any(
+        s["waiting"] and len(s["slots"]) < 2 for s in engine.step_log
+    )  # a slot sat idle
+
+
+@pytest.mark.parametrize(
+    "batching, n_steps, idle_share", [("static", 12, 4 / 24), ("continuous", 10, 0.0)]
+)
+def test_idle_slot_share_counted_by_hand(tiny, batching, n_steps, idle_share):
+    """S5 in miniature, small enough to count: 2 slots, requests of 2, 6, 2 and 6 tokens.
+    Static runs r0+r1 for 6 steps, r0's slot empty for the last 4 while r2 and r3 wait, then
+    r2+r3 for 6 more (nothing waits by then). Continuous puts r2 into r0's slot at step 2 and
+    r3 into r2's at step 4, so r3's 6 tokens end at step 10."""
+    requests = [Request(i, [i + 1] * 3, n, arrival=0.0) for i, n in enumerate([2, 6, 2, 6])]
+
+    async def main():
+        async with running(tiny, batching=batching, n_slots=2) as engine:
+            await asyncio.gather(*(collect(engine, r) for r in requests))
+        return engine
+
+    engine = run(main())
+    assert len(engine.step_log) == n_steps
+    assert idle_slot_share(engine.step_log, slots=2) == pytest.approx(idle_share)

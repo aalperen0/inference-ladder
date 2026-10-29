@@ -65,6 +65,21 @@ def summarize(finished: list, elapsed: float) -> dict:
     return out
 
 
+def server_itl(records: list) -> dict[str, float]:
+    """ITL from the server's token stamps (load-client records after merge_server_log). The
+    client's ITL minus this is what localhost HTTP and SSE add."""
+    return _stats(np.concatenate([np.diff(r.server_token_times) for r in records]))
+
+
+def idle_slot_share(steps: list[dict], slots: int) -> float:
+    """The share of all slot-steps left empty while requests waited: capacity the batching
+    threw away (E6). Counted in steps, not seconds. `waiting` is counted after admission, so
+    under continuous batching a slot sits empty while requests wait only when the KV budget
+    blocks the head of the queue."""
+    idle = sum(slots - len(s["slots"]) for s in steps if s["waiting"])
+    return idle / (slots * len(steps))
+
+
 def goodput(finished: list, slo: dict[str, float]) -> float:
     """The fraction of requests that meet every SLO at once.
     slo = {"ttft": s, "tpot": s, "latency": s}, in seconds."""

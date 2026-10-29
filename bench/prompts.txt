@@ -1,0 +1,11 @@
+# priority | prompt        0 is the highest ; a line without "|" gets priority 0
+# Read by bench/send_prompts.py, which sends them all at once.
+
+2 | Once upon a time
+2 | The capital of France is
+1 | What is a bird
+0 | In 1969, astronauts
+0 | The best way to learn a language is
+1 | My favourite food is
+2 | The weather today is
+1 | Q: What is the speed of light?\nA:

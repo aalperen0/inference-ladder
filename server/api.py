@@ -82,7 +82,7 @@ def describe(engine: AsyncEngine) -> dict:
         "kv_cache_bytes": cache.key_cache.nbytes + cache.value_cache.nbytes,
         "policy": sched.policy,
         "max_wait": sched.max_wait,
-        "batching": "continuous",
+        "batching": sched.batching,
         "chunk_size": None,
         "eos_id": sched.eos_id,
     }
@@ -252,6 +252,7 @@ def main():
             model,
             cache,
             args.kv_budget,
+            batching=args.batching,
             policy=args.policy,
             max_wait=args.max_wait,
             eos_id=EOS_ID,

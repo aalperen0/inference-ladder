@@ -28,9 +28,13 @@ TIMES = ("scheduled", "sent_at", "finished_at", "server_arrival", "prefill_start
 TIME_LISTS = ("token_times", "server_token_times")
 
 
-def run_name(policy: str, rate: float, seed: int) -> str:
-    """fcfs_lambda-2_seed-0"""
-    return f"{policy}_lambda-{rate:g}_seed-{seed}"
+def run_name(config: dict, rate: float, seed: int) -> str:
+    """continuous_fcfs_slots-8_chunk-none_lambda-2_seed-0, from the server's /internal/config."""
+    chunk = "none" if config["chunk_size"] is None else config["chunk_size"]
+    return (
+        f"{config['batching']}_{config['policy']}_slots-{config['slots']}_chunk-{chunk}"
+        f"_lambda-{rate:g}_seed-{seed}"
+    )
 
 
 def environment() -> dict:
